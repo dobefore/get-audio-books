@@ -82,9 +82,6 @@ jobs:
     name: Publish Release
     runs-on: ubuntu-latest
     needs:
-      - linux
-      - macos
-      - windows
       - arm64
     steps:
       - name: Check out code
