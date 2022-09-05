@@ -48,7 +48,7 @@ jobs:
         run: tar -zxvf $HOME/openssl1.1.1f_1.1.1_linux_arm64.tar.gz -C $HOME
       
       - name: oopy extracted OpenSSL folder to home
-        run: cp -r openssl1.1.1f_1.1.1_linux_arm64/openssl $HOME/openssl
+        run: cp -r $HOME/openssl1.1.1f_1.1.1_linux_arm64/openssl $HOME/openssl
       # build static-linked binary for arm64 (also suitable for aarch64)
       - name: Build 
         run: | 
