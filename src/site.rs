@@ -411,11 +411,43 @@ impl Lit2GoLink {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Lit2Go {
     pub(crate) root_site: Option<String>,
+      /// show how many books this website  will have 
+      book_count:Option<u8>,
     bookpages: Option<Vec<BookPage>>,
 }
-
+impl Utils for Lit2Go {type Item = Option<Vec<BookPage>>;    }
 impl Down for Lit2Go {}
 impl Lit2Go {
+    fn count_actual_books( &self,)->u8 {
+        if let Some(bgs) =self.bookpages.as_ref()  {
+            bgs.len() as u8
+        }else {
+            0
+        }
+    }
+    fn equal_non_zero( &self,)->bool {
+        let acctual=self.count_actual_books();
+        if acctual!=0 {
+            if acctual==self.book_count.unwrap() {
+               true
+            }else {
+                false
+            }  
+        }else {
+            false
+        }
+       
+    }
+     /// check whether chapters in each book are fully parsed by check count equal 
+     fn check_audio_sanity_of_chapters( &self,)->bool {
+        self.bookpages.as_ref().unwrap().iter().all(|e|e.chapters.as_ref().unwrap().iter().all(|c|c.audio_sanity()))
+    
+        }
+    /// check whether chapters in each book are fully parsed by check count equal 
+    fn check_chapter_sanity_of_books( &self,)->bool {
+    self.bookpages.as_ref().unwrap().iter().all(|e|e.equal_non_zero())
+
+    }
     /// chapter_name as the filename of audio and odf
     async fn down_local(
         &self,
@@ -548,10 +580,15 @@ impl Lit2Go {
             let reader = std::io::BufReader::new(f);
             let lg: Lit2Go = serde_json::from_reader(reader)?;
             self.set_bookpages(Some(lg.bookpages().unwrap().to_vec()));
+            if self.equal_non_zero(){
+                return Err(ApplicationError::ValueNotEqual("book numbers are not equal".into()));
+            }
             println!("loaded bookpages from file");
         } else {
             let html = self.request_text(self.root_site.as_ref().unwrap()).await?;
+            // in the begining, total books should be counted by count elements.
             let bgs = self.paese_book_page(&html, r#"figcaption[class="title"]"#, "a")?;
+           self.set_book_count(Some(bgs.len() as u8));
             self.set_bookpages(Some(bgs));
             println!("loaded bookpages from parsing crawling")
         }
@@ -564,17 +601,32 @@ impl Lit2Go {
         // parse chapter pages of each book
         // if chapter is none ,it means chapters of each have not been parsed,need parsing
         // write to lit2go
-        if self.last_bookpage().chapters.is_none() {
+        if !self.check_chapter_sanity_of_books(){
             // if encountered error,skip this book and log it
-            self.update_chapters_of_each_book(&error_log).await?;
+          match   self.update_chapters_of_each_book(&error_log).await {
+              Ok(_)=>{},
+              Err(_)=>{
+                let lg_str = serde_json::to_string(&self)?;
+                std::fs::write(&lit2go_file, lg_str)?;
+                return Err(ApplicationError::UpdateLit2go("update_chapters_of_each_book".into()));
+              }
+          };
             let lg_str = serde_json::to_string(&self)?;
             std::fs::write(&lit2go_file, lg_str)?;
         }
         println!("update chapters done");
         // if audiolink is none ,it means audio of each has not been parsed,need parsing
         // write to lit2go
-        if self.last_bookpage().last_chapter().audio.is_none() {
-            self.update_audio_of_each_chapter(&error_log).await?;
+        if self.check_audio_sanity_of_chapters() {
+
+            match self.update_audio_of_each_chapter(&error_log).await {
+                Ok(_)=>{},
+                Err(_)=>{
+                  let lg_str = serde_json::to_string(&self)?;
+                  std::fs::write(&lit2go_file, lg_str)?;
+                  return Err(ApplicationError::UpdateLit2go("update_audio_of_each_chapter".into()));
+                }
+            };
             let lg_str = serde_json::to_string(&self)?;
             std::fs::write(&lit2go_file, lg_str)?;
         }
@@ -622,41 +674,15 @@ impl Lit2Go {
         // loop ops
         let mut f = open_as_append_async(error_file).await?;
         for bg in self.bookpages.as_mut().unwrap() {
-            match bg.update_audio().await {
-                Ok(_) => {}
-                Err(_) => {
-                    f.write(
-                        format!(
-                            "update_audio book title: {},book_link {} \n",
-                            bg.book_name, bg.book_link
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    continue;
-                }
-            }
+             bg.update_audio().await?;
         }
         Ok(())
     }
     async fn update_chapters_of_each_book(&mut self, error_file: &Path) -> Result<()> {
         // loop ops
-        let mut f = open_as_append_async(error_file).await?;
+        // let mut f = open_as_append_async(error_file).await?;
         for bg in self.bookpages.as_mut().unwrap() {
-            match bg.update_chapters().await {
-                Ok(_) => {}
-                Err(_) => {
-                    f.write(
-                        format!(
-                            "update_chapters book title: {},book_link {} \n",
-                            bg.book_name, bg.book_link
-                        )
-                        .as_bytes(),
-                    )
-                    .await?;
-                    continue;
-                }
-            }
+             bg.update_chapters().await ?;
         }
         Ok(())
     }
@@ -669,6 +695,10 @@ impl Lit2Go {
     }
     pub(crate) fn last_bookpage(&self) -> &BookPage {
         self.bookpages.as_ref().unwrap().last().as_ref().unwrap()
+    }
+
+    pub(crate) fn set_book_count(&mut self, book_count: Option<u8>) {
+        self.book_count = book_count;
     }
 }
 
@@ -736,6 +766,16 @@ fn parse_html_doc(html: &str, selector: &str) -> Result<Vec<String>> {
     }
     Ok(htmls)
 }
+trait Utils {
+    type Item;
+    fn count(&self,c:Option<Vec<Self::Item>>)->u8 {
+        if let Some(cc) =c  {
+            cc.len() as u8
+        }else {
+            0
+        }
+    }
+}
 #[async_trait]
 trait Down {
     async fn request_bytes(&self, link: &str) -> Result<Vec<u8>> {
@@ -766,16 +806,41 @@ trait Down {
 pub(crate) struct BookPage {
     book_name: String,
     book_link: String,
+    /// show how many chapters this book will have 
+    chapter_count:Option<u8>,
     chapters: Option<Vec<Chapter>>,
 }
+impl Utils for BookPage {type Item =Option<Vec<Chapter>>;    }
+
 impl Down for BookPage {}
 impl BookPage {
     fn new(book_name: String, book_link: String) -> Self {
         Self {
             book_name,
             book_link,
-            chapters: None,
+            ..Default::default()
         }
+    }
+   
+    fn count_actual_books( &self,)->u8 {
+        if let Some(bgs) =self.chapters.as_ref()  {
+            bgs.len() as u8
+        }else {
+            0
+        }
+    }
+    fn equal_non_zero( &self,)->bool {
+        let acctual=self.count_actual_books();
+        if acctual!=0 {
+            if acctual==self.chapter_count.unwrap() {
+               true
+            }else {
+                false
+            }  
+        }else {
+            false
+        }
+       
     }
     /// enter each book page ,parse html `dt` -> parse frac `a` to get chapters
     ///
@@ -798,23 +863,31 @@ impl BookPage {
     }
     async fn update_chapters(&mut self) -> Result<()> {
         // parse html of book link to get chapters
-        println!("update chapters of book {}", self.book_name);
+        // skip if chapter sanity test is ok
+        if self.equal_non_zero() {
+            return Ok(());
+        }
         let html = self.request_text(self.book_link.as_ref()).await?;
         match self.paese_chapter_page(&html, "dt", "a") {
-            Ok(cs) => self.set_chapters(Some(cs)),
+            Ok(cs) => {
+                self.set_chapter_count(Some(cs.len() as u8));
+                self.set_chapters(Some(cs))
+            },
             Err(_) => {
                 let mut f = open_as_append_async("error.log".as_ref()).await?;
-                f.write(self.book_link.as_bytes()).await?;
+                f.write(self.book_name.as_bytes()).await?;
+                return Err(ApplicationError::UpdateLit2go("update_chapters".into()));
             }
         };
-        // loop chapters to get audio
-
-        // set chapters
         Ok(())
     }
     async fn update_audio(&mut self) -> Result<()> {
         if let Some(cs) = self.chapters.as_mut() {
             for c in cs {
+        // skip if audio link exists 
+                if c.audio_sanity() {
+                    continue;
+                }
                 c.update_audio().await?;
             }
         }
@@ -834,6 +907,10 @@ impl BookPage {
     pub(crate) fn chapters(&self) -> Option<&Vec<Chapter>> {
         self.chapters.as_ref()
     }
+
+    pub(crate) fn set_chapter_count(&mut self, chapter_count: Option<u8>) {
+        self.chapter_count = chapter_count;
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -851,6 +928,19 @@ impl Chapter {
             capter_link,
             audio: None,
         }
+    }
+    /// return false if [`AudioLink`] is none or `audio_link` is none
+    fn audio_sanity(&self,)->bool{
+if self.audio.is_none() {
+    false
+}else {
+if    self.audio.as_ref().unwrap().audio_link().is_none()
+{
+    false
+}else {
+    true
+}
+}
     }
     /// return a pair of link and title
     fn parse_html_frac(&self, html: &str, selector: &str) -> Result<Vec<(Option<String>, String)>> {

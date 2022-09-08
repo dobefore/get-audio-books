@@ -17,6 +17,10 @@ pub enum ApplicationError {
     Regex(#[from] regex::Error),
     #[error("ValueNotFound error {0}")]
     ValueNotFound(String),
+    #[error("ValueNotFound error {0}")]
+    ValueNotEqual(String),
+    #[error("UpdateLit2go error {0}")]
+    UpdateLit2go(String),
     #[error("JsonParse error {0}")]
     Tokio(#[from] tokio::task::JoinError),
     #[error("JsonParse error {0}")]
