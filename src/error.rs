@@ -16,5 +16,9 @@ pub enum ApplicationError {
     #[error("JsonParse error {0}")]
     Regex(#[from] regex::Error),
     #[error("ValueNotFound error {0}")]
-    ValueNotFound(String)
+    ValueNotFound(String),
+    #[error("JsonParse error {0}")]
+    Tokio(#[from] tokio::task::JoinError),
+    #[error("JsonParse error {0}")]
+    SerDeser(#[from] serde_json::Error),
 }

@@ -1,17 +1,82 @@
-use crate::error::{ApplicationError, Result};
+use crate::{
+    error::{ApplicationError, Result},
+    fileops::{
+        append_str, append_str_async, open_as_append, open_as_append_async, open_as_read,
+        open_as_write, read_linnes,
+    },
+};
 use async_trait::async_trait;
 use json;
-use regex::Regex;
-use scraper::{Html, Selector};
+use regex::{internal::Input, Regex};
+use scraper::{element_ref::Select, ElementRef, Html, Selector};
+use serde::{Deserialize, Serialize};
+use std::{
+    borrow::Borrow,
+    fmt::Display,
+    fs::File,
+    io::SeekFrom,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    str::Bytes,
+};
 use tokio::io::AsyncWriteExt;
-use std::{borrow::Borrow, path::Path};
 ///https://freeaudiobooksonline.net/audiobook-list/recommended-audiobooks
 #[derive(Default, Debug)]
 pub(crate) struct PagePattern1 {
     root_link: String,
     bookpages1: Option<Vec<BookPage1>>,
 }
+async fn down_local(
+    book_title: &str,
+    part_link: Option<String>,
+    part_title: &str,
+    book_title_code: &str,
+    output: &Path,
+) -> Result<()> {
+    // create dir with book_title as its name ,write each part to this folder
+    // skip if dir exists
+    if !output.exists() {
+        tokio::fs::create_dir(&output).await?;
+    }
+    let error_log = output.join("error.log");
+    let book_dir = output.join(book_title_code);
+    if !book_dir.exists() {
+        tokio::fs::create_dir(&book_dir).await?;
+    }
+    println!("downloading book {}", book_title);
 
+    let fname = format!("{}.mp3", part_title);
+    if part_link.is_none() {
+        let mut f = open_as_append_async(&error_log).await?;
+        f.write(
+            format!(
+                "book part link is missing,whhose book name,part title are {},{}",
+                book_title, part_title
+            )
+            .as_bytes(),
+        )
+        .await?;
+    } else {
+        println!(
+            "downloading book part {} from link {}",
+            part_title,
+            part_link.as_ref().unwrap()
+        );
+        let  pc="Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36";
+      
+        // tokio::process::Command::new("curl").args(&[part_link.as_ref().unwrap(),"-o",book_dir.join(fname).to_str().unwrap(),]).status().await.expect("");
+        // std::process::Command::new("curl").args(&[part_link.as_ref().unwrap(),"-o",book_dir.join(fname).to_str().unwrap(),"-s"]).status().expect("");
+
+        // std::process::Command::new("curl").args(&[part_link.as_ref().unwrap(),"-o",book_dir.join(fname).to_str().unwrap(),"-s"]).status().expect("");
+        //     let bytes = reqwest::blocking::ClientBuilder::new()
+        //       .user_agent(pc)
+        //       .build()?.get(part_link.as_ref().unwrap())
+        //       .send()?.bytes()? ;
+
+        // tokio::fs::write(book_dir.join(fname), bytes).await?;
+    }
+    Ok(())
+}
 impl PagePattern1 {
     pub(crate) fn new(root_link: String) -> Self {
         Self {
@@ -29,7 +94,8 @@ impl PagePattern1 {
             .await?
             .text()
             .await?;
-        Ok(text) }
+        Ok(text)
+    }
     fn update_bookpages(&mut self, bgs: Vec<BookPage1>) -> Result<()> {
         self.bookpages1 = Some(bgs);
         Ok(())
@@ -54,7 +120,9 @@ impl PagePattern1 {
         };
         let ele = fragment.select(&selector?).next();
         if ele.is_none() {
-            return Err(ApplicationError::ParseHtmlSelector("选择的元素为空或不存在".into()));
+            return Err(ApplicationError::ParseHtmlSelector(
+                "选择的元素为空或不存在".into(),
+            ));
         }
         let link = ele.as_ref().unwrap().value().attr("href");
         let title = ele.as_ref().unwrap().text().collect::<Vec<_>>();
@@ -69,14 +137,22 @@ impl PagePattern1 {
         let document = Html::parse_document(html);
         let selector = match Selector::parse(selector) {
             Ok(s) => s,
-            Err(_) =>return Err(ApplicationError::ParseHtmlSelector(format!(
-                "parse {} element error",
-                selector
-            ))),
+            Err(_) => {
+                return Err(ApplicationError::ParseHtmlSelector(format!(
+                    "parse {} element error",
+                    selector
+                )))
+            }
         };
         let mut bgs = vec![];
-        if document.select(&selector.clone()).collect::<Vec<_>>().is_empty() {
-            return Err(ApplicationError::ParseHtmlSelector("选择的元素为空或不存在".into()));
+        if document
+            .select(&selector.clone())
+            .collect::<Vec<_>>()
+            .is_empty()
+        {
+            return Err(ApplicationError::ParseHtmlSelector(
+                "选择的元素为空或不存在".into(),
+            ));
         }
         for element in document.select(&selector) {
             // println!("{:?}",element.value().attr("href"))
@@ -86,49 +162,9 @@ impl PagePattern1 {
         }
         Ok(bgs)
     }
-    async fn down_local(&self, book_title: &str, parts: &[Part],real_book_title:&str) -> Result<()> {
-        // create dir with book_title as its name ,write each part to this folder
-        // skip if dir exists
-        let p = Path::new("output");
-        if !p.exists() {
-            tokio::fs::create_dir(p).await?;
-        }
-        let error_log=p.join("error.log");
-        let book_dir = p.join(real_book_title);
-        if !book_dir.exists() {
-            tokio::fs::create_dir(&book_dir).await?;
-        }
-println!("downloading book {}",book_title);
-        // loop parts
-        for p in parts {
-            // get link and title (as filename)
-            let link = &p.audio_link;
-            let fname = format!("{}.mp3", p.audio_title);
-            if link.is_none() {
-               let mut f= tokio::fs::OpenOptions::new().create(true).append(true).open(&error_log).await?;
-           f.write(format!("book part link is missing,whhose book name,part title are {},{}",book_title,p.audio_title).as_bytes()).await?;
-        continue;  
-        }
-            println!("downloading book part {} from link {}",p.audio_title,link.as_ref().unwrap());
-if book_dir.join(&fname).exists() {
-    continue;
-}
-            let  pc="Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36";
-           
-            let resp = reqwest::ClientBuilder::new()
-                .user_agent(pc)
-                .build()?
-                .get(link.as_ref().unwrap())
-                .send()
-                .await?
-                .bytes()
-                .await?;
-            tokio::fs::write(book_dir.join(fname), resp).await?;
-        }
 
-        Ok(())
-    }
-    pub(crate) async fn down(&mut self) -> Result<()> {
+    /// write crawled book links to local file `link_file`
+    pub(crate) async fn write(&mut self, link_file: &Path) -> Result<()> {
         let text = self.request_text(&self.root_link).await?;
         let bgs = self.parse_html_doc(
             &text,
@@ -136,16 +172,69 @@ if book_dir.join(&fname).exists() {
         )?;
         self.update_bookpages(bgs)?;
         self.update_parts().await?;
-        // loop BookPage1 to down
+        let mut f = open_as_append(&link_file)?;
         if let Some(bgs) = self.bookpages1.as_ref() {
-            let mut n=0;
+            let mut book_num = 0;
             for bg in bgs {
-                self.down_local(bg.book_title.as_ref().unwrap(), bg.parts.as_ref().unwrap(),&n.to_string())
-                    .await?;
-                    n+=1;
+                if let Some(parts) = bg.parts.as_ref() {
+                    for part in parts {
+                        let lg = LinkPage::new(
+                            bg.book_title.as_ref().map(|e| e.to_string()),
+                            Some(part.audio_title.to_owned()),
+                            part.audio_link.as_ref().map(|e| e.to_string()),
+                            book_num.to_string(),
+                        );
+
+                        append_str(&mut f, &lg.to_string())?;
+                    }
+                    book_num += 1;
+                }
             }
         }
+
         // test audio link valid.
+        Ok(())
+    }
+    // split code into 2 parts: write links to local and download from local links
+    pub(crate) async fn down(&self, link_file: &Path, output: &Path) -> Result<()> {
+        // read file from link_file
+        let mut f = open_as_read(link_file)?;
+        let lines = read_linnes(&mut f)?;
+
+        for i in lines {
+            let lg: LinkPage = i.into();
+            let output = output.to_owned().clone();
+            let links = output.join("links.txt");
+            let error_log = output.join("error_log.txt");
+
+            let mut f = open_as_append(&links)?;
+            let mut error = open_as_append(&error_log)?;
+
+            if lg.part_link.is_none() {
+                writeln!(
+                    &mut error,
+                    "{}",
+                    format!(
+                        "book title {},part title {}",
+                        lg.book_title.clone().as_ref().unwrap(),
+                        lg.part_link.as_ref().unwrap(),
+                    )
+                )?;
+            } else {
+                writeln!(&mut f, "{}", lg.part_link.as_ref().unwrap())?;
+            }
+            //  down_local(
+            //         lg.book_title.clone().as_ref().unwrap(),
+            //         lg.part_link,
+            //         lg.part_tilte.as_ref().unwrap(),
+            //         &lg.book_title_code,
+            //        &output ,
+            //     )
+            //     .await?
+
+            //    ;
+        }
+
         Ok(())
     }
 }
@@ -189,17 +278,18 @@ impl BookPage1 {
             let mut js = json::parse(cap_str.strip_suffix(",").unwrap())?;
             let link = js.remove("src");
             let title = js.remove("title");
-        let   link=  if link.is_empty() {
-               Err( ApplicationError::ValueNotFound("empty value in link".into()))
-
-            }else {
+            let link = if link.is_empty() {
+                Err(ApplicationError::ValueNotFound(
+                    "empty value in link".into(),
+                ))
+            } else {
                 Ok(link)
             };
-          let link=  match link {
-                Ok(l)=>Some(l),
-                Err(_)=>None
+            let link = match link {
+                Ok(l) => Some(l),
+                Err(_) => None,
             };
-            let part = Part::new(link.map(|w|w.to_string()), title.to_string());
+            let part = Part::new(link.map(|w| w.to_string()), title.to_string());
             parts.push(part);
         }
 
@@ -217,7 +307,9 @@ impl BookPage1 {
         };
         let element = document.select(&selector?).next();
         if element.is_none() {
-            return Err(ApplicationError::ParseHtmlSelector("选择的元素为空或不存在".into()));
+            return Err(ApplicationError::ParseHtmlSelector(
+                "选择的元素为空或不存在".into(),
+            ));
         }
         let parts = self.json_parse(
             element
@@ -245,7 +337,10 @@ impl BookPage1 {
     }
     async fn update_parts(&mut self) -> Result<()> {
         // request book page to get html
-        println!("updating parts from book link {:?}", self.book_link.as_ref());
+        println!(
+            "updating parts from book link {:?}",
+            self.book_link.as_ref()
+        );
 
         let html = self.request_text(self.book_link.as_ref().unwrap()).await?;
         //  parse html to get audio lnk and title
@@ -259,9 +354,9 @@ impl BookPage1 {
     }
 }
 #[derive(Default, Debug)]
-struct Part {
-    audio_link: Option<String>,
-    audio_title: String,
+pub(crate) struct Part {
+    pub(crate) audio_link: Option<String>,
+    pub(crate) audio_title: String,
 }
 
 impl Part {
@@ -272,144 +367,687 @@ impl Part {
         }
     }
 }
-#[derive(Debug, Default)]
+
+/// links.txt
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Lit2GoLinks {
+    links: Option<Vec<Lit2GoLink>>,
+}
+
+impl Lit2GoLinks {
+    fn new(links: Option<Vec<Lit2GoLink>>) -> Self {
+        Self { links }
+    }
+}
+/// https://etc.usf.edu/lit2go/books/
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Lit2GoLink {
+    book_title_code: Option<String>,
+    book_title: Option<String>,
+    /// chapter_name as the filename of audio and odf
+    chapter_name: Option<String>,
+    audio_link: Option<String>,
+    /// multi-line string
+    text: Option<String>,
+}
+
+impl Lit2GoLink {
+    fn new(
+        book_title_code: Option<String>,
+        book_title: Option<String>,
+        chapter_name: Option<String>,
+        audio_link: Option<String>,
+        text: Option<String>,
+    ) -> Self {
+        Self {
+            book_title_code,
+            book_title,
+            chapter_name,
+            audio_link,
+            text,
+        }
+    }
+}
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Lit2Go {
-    pub(crate) root_site: String,
-    pub(crate) book_site: String,
+    pub(crate) root_site: Option<String>,
     bookpages: Option<Vec<BookPage>>,
 }
 
+impl Down for Lit2Go {}
 impl Lit2Go {
-    async fn down(&self) -> Result<()> {
-        Ok(())
-    }
-    fn parse_audio_link_for_each_chapter(&mut self) -> Result<()> {
-        Ok(())
-    }
-    fn parse_chapters_for_each_book(&mut self) -> Result<()> {
-        Ok(())
-    }
-    fn parse_root_html(&mut self, html: &str) -> Result<()> {
-        let document = Html::parse_document(html);
-        let selector = match Selector::parse("li") {
-            Ok(s) => Ok(s),
-            Err(_) => Err(ApplicationError::ParseHtmlSelector(
-                "parse li element error".into(),
-            )),
-        };
-
-        for element in document.select(&selector?) {
-            assert_eq!("li", element.value().name());
+    /// chapter_name as the filename of audio and odf
+    async fn down_local(
+        &self,
+        book_title_code: &str,
+        book_title: &str,
+        chapter_name: &str,
+        audio_link: &str,
+        pdf_link: &str,
+        output: &Path,
+    ) -> Result<()> {
+        // create dir with book_title as its name ,write each part to this folder
+        // skip if dir exists
+        if !output.exists() {
+            tokio::fs::create_dir(&output).await?;
         }
-        Ok(())
-    }
-}
-/// convert a specific string to an instance of site struct.e.g. "Lit2Go" -> [`Lit2Go`]
-pub(crate) fn convert_to_site(s: &str) -> Option<Sites> {
-    match s {
-        "Lit2Go" => Some(Sites::Lit2Go(Lit2Go::new())),
-        _ => None,
-    }
-}
-#[async_trait]
-impl Down for Lit2Go {
-    fn parse_html(&self, html: &str) -> Result<()> {
-        let document = Html::parse_document(html);
-        let selector = match Selector::parse("li") {
-            Ok(s) => Ok(s),
-            Err(_) => Err(ApplicationError::ParseHtmlSelector(
-                "parse li element error".into(),
-            )),
-        };
-
-        for element in document.select(&selector?) {
-            assert_eq!("li", element.value().name());
+        let error_log = output.join("error.log");
+        let book_dir = output.join(book_title_code);
+        if !book_dir.exists() {
+            tokio::fs::create_dir(&book_dir).await?;
         }
+        println!("downloading book {}", book_title);
+
+        let audio_fname = format!("{}.mp3", chapter_name);
+        let pdf_fname = format!("{}.pdf", chapter_name);
+
+        println!(
+            "downloading book chapter {} from link {}",
+            chapter_name, audio_link
+        );
+
+        // tokio::process::Command::new("curl").args(&[part_link.as_ref().unwrap(),"-o",book_dir.join(fname).to_str().unwrap(),"-s"]).spawn().expect("");
+        // std::process::Command::new("curl").args(&[part_link.as_ref().unwrap(),"-o",book_dir.join(fname).to_str().unwrap(),"-s"]).spawn().expect("");
+        let audio_bytes = self.request_bytes(&audio_link).await?;
+        let pdf_bytes = self.request_bytes(&pdf_link).await?;
+
+        tokio::fs::write(book_dir.join(audio_fname), audio_bytes).await?;
+        tokio::fs::write(book_dir.join(pdf_fname), pdf_bytes).await?;
+
         Ok(())
     }
+    pub(crate) async fn down(&self, output: &Path) -> Result<()> {
+        // read links from file via serde_json
+        let links_file = output.join("links.txt");
+        let f = open_as_read(&links_file)?;
+        let reader = std::io::BufReader::new(f);
+        let links: Lit2GoLinks = serde_json::from_reader(reader)?;
+        // loop links to download to local async
+        if let Some(links) = links.links.as_ref() {
+            for link in links {
+                let book_title_code = link.book_title_code.as_ref().unwrap();
+                let book_title = link.book_title.as_ref().unwrap();
+                let audio_link = link.audio_link.as_ref().unwrap();
 
-    async fn request_link(&self, link: &str) -> Result<String> {
-        Ok(reqwest::get(link).await?.text().await?)
-    }
-    async fn download_all(&mut self) -> Result<()> {
-        // request book info site and get html of book page
-        let book_info = self.request_link(&self.book_site).await?;
-        // parse html str to get a vec of page links of all books,
-        self.parse_root_html(&book_info)?;
-        // iterate book page links, request each book link and get html of each book page
-        // parse html of each book page to get a vec of  chapter links and titles
-        self.parse_chapters_for_each_book()?;
-        // request each chapter link to get its html stream and parse it to get audio link(.mp3) and
-        // text link(pdf)
-        self.parse_audio_link_for_each_chapter()?;
-        // download audio and text to local fs. path output/bookname/chaptername/
-        self.down().await?;
+                let chapter_name = link.chapter_name.as_ref().unwrap();
+
+                let pdf_link = link.text.as_ref().unwrap();
+
+                self.down_local(
+                    book_title_code,
+                    book_title,
+                    chapter_name,
+                    audio_link,
+                    pdf_link,
+                    output,
+                )
+                .await?;
+            }
+        }
+
+        // in order to avoid filename naming error due to illegal characters like : ,we
+        // have to remove/strip this from chapter name
         Ok(())
     }
-}
-#[async_trait]
-trait Down {
-    /// download_all books
-    async fn download_all(&mut self) -> Result<()>;
-    ///  request each book link and return response text in String
-    async fn request_link(&self, link: &str) -> Result<String>;
-    /// parse html document and return selected elements
-    fn parse_html(&self, html: &str) -> Result<()>;
-}
-
-impl Lit2Go {
-    fn new() -> Self {
+    fn blank(&self) -> Result<()> {
+        Ok(())
+    }
+    pub(crate) fn new() -> Self {
         Self {
-            root_site: "https://etc.usf.edu/lit2go/".into(),
-            book_site: "https://etc.usf.edu/lit2go/books/".into(),
+            root_site: Some("https://etc.usf.edu/lit2go/books/".into()),
             ..Self::default()
         }
     }
+    fn paese_book_page(
+        &self,
+        html: &str,
+        selector: &str,
+        sub_selector: &str,
+    ) -> Result<Vec<BookPage>> {
+        let htmls = parse_html_doc(&html, selector)?;
+        let mut bgs = vec![];
+        for html in htmls {
+            let (link, title) = parse_html_frac(&html, sub_selector)?;
+            let bg = BookPage::new(title, link.as_ref().unwrap().to_string());
+            bgs.push(bg);
+        }
+        Ok(bgs)
+    }
+    /// write parsed links to local
+    ///
+    /// format: `book_title_code:::book_title:::chapter_title:::audio_link:::pdf_link`
+    ///
+    /// audio_link and pdf_link named after chapter_title ,notice remove :
+    ///
+    /// book page parse html figcaption[class="title"] -> parse frac `a`
+    ///
+    /// through inspecting some book site,find some chapters have no pdf link/element (e.g. PREFACE),
+    /// even formal chapters are the same. so I crawl plain text instead of pdf link no matter where pdf link is present.
+    /// And need to crawl a bigger html part while getting audio links,namely `div`,then get audio link from it,and
+    /// get text from it too,if text and audio are both absent,log it.
+    ///
+    /// /// Some chapters have 3 item in audio row.
+    ///
+    /// # How to crawl audio and plain text
+    ///
+    /// due to deferences described above,I change to elements to be parsed.
+    ///
+    /// 1. crawl a bigger part of html including audio link and plain text, div[id="i_apologize_for_the_soup"]
+    ///
+    /// 2. parse audio and text , audio:tag "source" ,first matched ele,get attr "src".
+    /// palin text(text is arranged in a vec of tag p) : parse tag p ,get text ,then join text (note \n,add if not)
 
-    /// return books by alphabetic index.
-    fn index_by_alphabet() {}
+    pub(crate) async fn write(&mut self, output: &Path) -> Result<()> {
+        // parse book page,if bgs_file exist skip
+        let lit2go_file = output.join("lit2go.txt");
+        let error_log = output.join("error_log.txt");
+        let lit2g_links = output.join("lit2g_links.txt");
+
+        if lit2go_file.exists() {
+            let f = open_as_read(&lit2go_file)?;
+            let reader = std::io::BufReader::new(f);
+            let lg: Lit2Go = serde_json::from_reader(reader)?;
+            self.set_bookpages(Some(lg.bookpages().unwrap().to_vec()));
+            println!("loaded bookpages from file");
+        } else {
+            let html = self.request_text(self.root_site.as_ref().unwrap()).await?;
+            let bgs = self.paese_book_page(&html, r#"figcaption[class="title"]"#, "a")?;
+            self.set_bookpages(Some(bgs));
+            println!("loaded bookpages from parsing crawling")
+        }
+
+        println!(" write litgo struct to local");
+
+        let lg_str = serde_json::to_string(&self)?;
+        std::fs::write(&lit2go_file, lg_str)?;
+
+        // parse chapter pages of each book
+        // if chapter is none ,it means chapters of each have not been parsed,need parsing
+        // write to lit2go
+        if self.last_bookpage().chapters.is_none() {
+            // if encountered error,skip this book and log it
+            self.update_chapters_of_each_book(&error_log).await?;
+            let lg_str = serde_json::to_string(&self)?;
+            std::fs::write(&lit2go_file, lg_str)?;
+        }
+        println!("update chapters done");
+        // if audiolink is none ,it means audio of each has not been parsed,need parsing
+        // write to lit2go
+        if self.last_bookpage().last_chapter().audio.is_none() {
+            self.update_audio_of_each_chapter(&error_log).await?;
+            let lg_str = serde_json::to_string(&self)?;
+            std::fs::write(&lit2go_file, lg_str)?;
+        }
+        println!("set audio done");
+        let  lgl = open_as_write(&lit2g_links)?;
+        let writer = std::io::BufWriter::new(lgl);
+        self.write_local(writer)?;
+        Ok(())
+    }
+    fn write_local(&self, writer: BufWriter<File>) -> Result<()> {
+        let bgs = self.bookpages.as_ref();
+        if let Some(bgs) = bgs {
+            let mut book_num = 0;
+            let mut lgl_vec = vec![];
+            for bg in bgs {
+                if let Some(chapters) = bg.chapters.as_ref() {
+                    for chapter in chapters {
+                        let audio_link = chapter.audio.as_ref().unwrap().audio_link();
+                        let text = chapter.audio.as_ref().unwrap().text();
+                        if audio_link.is_none() {
+                            return Err(ApplicationError::ValueNotFound(
+                                "write to local error , audio link not found".into(),
+                            ));
+                        }
+                        let lgl = Lit2GoLink::new(
+                            Some(book_num.to_string()),
+                            Some(bg.book_name()),
+                            Some(chapter.chapter_name()),
+                            Some(audio_link.as_ref().unwrap().to_string()),
+                            Some(text),
+                        );
+                        lgl_vec.push(lgl);
+                    }
+                    book_num += 1;
+                }
+            }
+            let lgls = Lit2GoLinks::new(Some(lgl_vec));
+            let s = serde_json::to_string(&lgls)?;
+            serde_json::to_writer(writer, &s)?;
+        }
+
+        Ok(())
+    }
+    async fn update_audio_of_each_chapter(&mut self, error_file: &Path) -> Result<()> {
+        // loop ops
+        let mut f = open_as_append_async(error_file).await?;
+        for bg in self.bookpages.as_mut().unwrap() {
+            match bg.update_audio().await {
+                Ok(_) => {}
+                Err(_) => {
+                    f.write(
+                        format!(
+                            "update_audio book title: {},book_link {} \n",
+                            bg.book_name, bg.book_link
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn update_chapters_of_each_book(&mut self, error_file: &Path) -> Result<()> {
+        // loop ops
+        let mut f = open_as_append_async(error_file).await?;
+        for bg in self.bookpages.as_mut().unwrap() {
+            match bg.update_chapters().await {
+                Ok(_) => {}
+                Err(_) => {
+                    f.write(
+                        format!(
+                            "update_chapters book title: {},book_link {} \n",
+                            bg.book_name, bg.book_link
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                    continue;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn set_bookpages(&mut self, bookpages: Option<Vec<BookPage>>) {
+        self.bookpages = bookpages;
+    }
+
+    pub(crate) fn bookpages(&self) -> Option<&Vec<BookPage>> {
+        self.bookpages.as_ref()
+    }
+    pub(crate) fn last_bookpage(&self) -> &BookPage {
+        self.bookpages.as_ref().unwrap().last().as_ref().unwrap()
+    }
 }
-pub(crate) enum Sites {
-    Lit2Go(Lit2Go),
+
+fn selector_parse_doc(html: &str, selector: &str) -> Result<(Html, Selector)> {
+    let document = Html::parse_document(html);
+    match Selector::parse(selector) {
+        Ok(s) => return Ok((document, s)),
+        Err(_) => {
+            return Err(ApplicationError::ParseHtmlSelector(format!(
+                "parse {} element error",
+                selector
+            )))
+        }
+    };
 }
-impl Sites {
-    /// download_all books from a specific website
-    pub(crate) async fn download_all(&mut self) -> Result<()> {
-        match self {
-            Self::Lit2Go(lg) => {
-                lg.download_all().await?;
+fn selector_parse_frac(html: &str, selector: &str) -> Result<(Html, Selector)> {
+    let fragment = Html::parse_fragment(html);
+    match Selector::parse(selector) {
+        Ok(s) => Ok((fragment, s)),
+        Err(_) => Err(ApplicationError::ParseHtmlSelector(format!(
+            "parse {} element error",
+            selector
+        ))),
+    }
+}
+/// return a pair of link and title
+fn parse_html_frac(html: &str, selector: &str) -> Result<(Option<String>, String)> {
+    let (document, selector) = selector_parse_frac(html, &selector)?;
+    let mut elements = document.select(&selector);
+
+    // assume there is only one ele
+    if let Some(e) = elements.next() {
+        let link = e.value().attr("href");
+        let title = e.text();
+        return Ok((
+            link.map(|e| e.to_string()),
+            title
+                .collect::<Vec<_>>()
+                .last()
+                .as_ref()
+                .unwrap()
+                .to_string(),
+        ));
+    } else {
+        println!("{}", format!("html {}, selector ", html,));
+        return Err(ApplicationError::ParseHtmlSelector(
+            "选择的元素为空或不存在".into(),
+        ));
+    }
+}
+/// return html strings of matched elements
+fn parse_html_doc(html: &str, selector: &str) -> Result<Vec<String>> {
+    let (document, selector) = selector_parse_doc(html, selector)?;
+    let elements = document.select(&selector).collect::<Vec<_>>();
+    if elements.is_empty() {
+        println!("parse_html_doc {}", format!("html {}, selector ", html,));
+
+        return Err(ApplicationError::ParseHtmlSelector(
+            "选择的元素为空或不存在".into(),
+        ));
+    }
+    let mut htmls = vec![];
+    for e in elements {
+        htmls.push(e.html());
+    }
+    Ok(htmls)
+}
+#[async_trait]
+trait Down {
+    async fn request_bytes(&self, link: &str) -> Result<Vec<u8>> {
+        let  pc="Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36";
+        Ok(reqwest::blocking::ClientBuilder::new()
+            .user_agent(pc)
+            .build()?
+            .get(link)
+            .send()?
+            .bytes()?
+            .to_vec())
+    }
+    async fn request_text(&self, link: &str) -> Result<String> {
+        let  pc="Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36";
+        let text = reqwest::ClientBuilder::new()
+            .user_agent(pc)
+            .build()?
+            .get(link)
+            .send()
+            .await?
+            .text()
+            .await?;
+        Ok(text)
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct BookPage {
+    book_name: String,
+    book_link: String,
+    chapters: Option<Vec<Chapter>>,
+}
+impl Down for BookPage {}
+impl BookPage {
+    fn new(book_name: String, book_link: String) -> Self {
+        Self {
+            book_name,
+            book_link,
+            chapters: None,
+        }
+    }
+    /// enter each book page ,parse html `dt` -> parse frac `a` to get chapters
+    ///
+    fn paese_chapter_page(
+        &self,
+        html: &str,
+        selector: &str,
+        sub_selector: &str,
+    ) -> Result<Vec<Chapter>> {
+        let htmls = parse_html_doc(&html, selector)?;
+        let mut chps = vec![];
+        println!("paese_chapter_page");
+        for html in htmls {
+            println!("chapter {}", html.clone());
+            let (link, title) = parse_html_frac(&html, sub_selector)?;
+            let chap = Chapter::new(title, link.as_ref().unwrap().to_string());
+            chps.push(chap);
+        }
+        Ok(chps)
+    }
+    async fn update_chapters(&mut self) -> Result<()> {
+        // parse html of book link to get chapters
+        println!("update chapters of book {}", self.book_name);
+        let html = self.request_text(self.book_link.as_ref()).await?;
+        match self.paese_chapter_page(&html, "dt", "a") {
+            Ok(cs) => self.set_chapters(Some(cs)),
+            Err(_) => {
+                let mut f = open_as_append_async("error.log".as_ref()).await?;
+                f.write(self.book_link.as_bytes()).await?;
+            }
+        };
+        // loop chapters to get audio
+
+        // set chapters
+        Ok(())
+    }
+    async fn update_audio(&mut self) -> Result<()> {
+        if let Some(cs) = self.chapters.as_mut() {
+            for c in cs {
+                c.update_audio().await?;
             }
         }
 
         Ok(())
     }
-}
+    fn book_name(&self) -> String {
+        self.book_name.to_string()
+    }
 
-#[derive(Debug, Default)]
-struct BookPage {
-    book_name: String,
-    book_link: String,
-    chapters: Vec<Chapter>,
-}
-
-impl BookPage {
-    fn new() -> Self {
-        Self::default()
+    pub(crate) fn set_chapters(&mut self, chapters: Option<Vec<Chapter>>) {
+        self.chapters = chapters;
+    }
+    pub(crate) fn last_chapter(&self) -> &Chapter {
+        self.chapters.as_ref().unwrap().last().as_ref().unwrap()
+    }
+    pub(crate) fn chapters(&self) -> Option<&Vec<Chapter>> {
+        self.chapters.as_ref()
     }
 }
-#[derive(Debug, Default)]
-struct Chapter {
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct Chapter {
     chapter_name: String,
     capter_link: String,
-    audiolinks: Option<Vec<AudioLink>>,
+    /// one chapter has one audio
+    pub(crate) audio: Option<AudioLink>,
 }
-
+impl Down for Chapter {}
 impl Chapter {
-    fn parse_link(&mut self) {}
+    fn new(chapter_name: String, capter_link: String) -> Self {
+        Self {
+            chapter_name,
+            capter_link,
+            audio: None,
+        }
+    }
+    /// return a pair of link and title
+    fn parse_html_frac(&self, html: &str, selector: &str) -> Result<Vec<(Option<String>, String)>> {
+        let (document, selector) = selector_parse_frac(html, selector)?;
+        let mut pairs = vec![];
+        // assume there is only one ele
+        for e in document.select(&selector) {
+            let link = e.value().attr("href");
+            let title = e.text();
+            pairs.push((
+                link.map(|e| e.to_string()),
+                title
+                    .collect::<Vec<_>>()
+                    .last()
+                    .as_ref()
+                    .unwrap()
+                    .to_string(),
+            ))
+        }
+        Ok(pairs)
+    }
+    /// enter chapter page ，parse html ul[id="downloads"] -> parse frac a ,get 2 eles,1st audio,2nd pdf
+    fn parse_audio_page(
+        &mut self,
+        html: &str,
+        selector: &str,
+        sub_selector: &str,
+    ) -> Result<AudioLink> {
+        let htmls = parse_html_doc(&html, selector)?;
+        let html = htmls.last();
+        println!("parse_html_doc result {}", &html.as_ref().unwrap());
+        let pairs = self.parse_html_frac(&html.as_ref().unwrap(), sub_selector)?;
+        let audio_link = pairs.first();
+        let pdf = pairs.get(1);
+        if audio_link.is_none() || pdf.is_none() {
+            return Err(ApplicationError::ValueNotFound(
+                "audio_link or pdf link item not found".into(),
+            ));
+        }
+        let (audio_link, _) = pairs.first().as_ref().unwrap();
+        let (pdf, _) = pairs.get(1).as_ref().unwrap();
+        println!("link of audio and pdf {:?}, {:?}", audio_link, pdf);
+        let audio = AudioLink::new(
+            Some(audio_link.as_ref().unwrap().to_string()),
+            pdf.as_ref().unwrap().to_string(),
+        );
+
+        Ok(audio)
+    }
+    /// palin text(text is arranged in a vec of tag p) : parse tag p ,get text ,then join text (note \n,add if not)
+    fn parse_plain_text(&self, document: &Html, selector: &Selector) -> Result<String> {
+        let ele = document.select(&selector).next();
+        let text = if let Some(e) = ele {
+            let (doc, sel) = selector_parse_frac(&e.html(), "p")?;
+            let txt = doc
+                .select(&sel)
+                .into_iter()
+                .map(|e| e.text())
+                .collect::<Vec<_>>();
+            let t = txt
+                .iter()
+                .map(|e| e.to_owned().collect::<Vec<_>>().join(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            t
+        } else {
+            return Err(ApplicationError::ParseHtmlSelector(
+                "parse_plain_text error".into(),
+            ));
+        };
+        Ok(text)
+    }
+    /// parse audio  , audio:tag "source" ,first matched ele,get attr "src".
+    fn parse_audi_link(&self, document: &Html, selector: &Selector) -> Result<String> {
+        let ele = document.select(&selector).next();
+        if let Some(e) = ele {
+            let (doc, sel) = selector_parse_frac(&e.html(), "source")?;
+            let el = doc.select(&sel).next();
+            let ele = el.as_ref().unwrap();
+            let src = match ele.value().attr("src") {
+                Some(s) => Ok(s.to_string()),
+                None => Err(ApplicationError::ValueNotFound("get attr src none".into())),
+            };
+            Ok(src?)
+        } else {
+            return Err(ApplicationError::ValueNotFound("get selector none".into()));
+        }
+    }
+    async fn update_audio(&mut self) -> Result<()> {
+        println!("update audio of chapter {}", self.chapter_name);
+        let html = self.request_text(&self.capter_link).await?;
+        let (document, selector) =
+            selector_parse_frac(&html, r#"div[id="i_apologize_for_the_soup"]"#)?;
+        let audio_link = self.parse_audi_link(&document, &selector)?;
+        let text = self.parse_plain_text(&document, &selector)?;
+        let audio = AudioLink::new(Some(audio_link), text);
+        self.set_audio(Some(audio));
+        Ok(())
+    }
+    fn set_audio(&mut self, audio: Option<AudioLink>) {
+        self.audio = audio;
+    }
+
+    fn chapter_name(&self) -> String {
+        self.chapter_name.to_string()
+    }
 }
 
-#[derive(Debug, Default)]
-struct AudioLink {
-    audio_link: String,
-    pdf_link: String,
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct AudioLink {
+    audio_link: Option<String>,
+    /// contain mulit-line plain text string
+    text: String,
+}
+
+impl AudioLink {
+    pub(crate) fn new(audio_link: Option<String>, text: String) -> Self {
+        Self { audio_link, text }
+    }
+
+    pub(crate) fn audio_link(&self) -> Option<String> {
+        self.audio_link.as_ref().map(|e| e.to_string())
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.text.to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LinkPage {
+    book_title_code: String,
+    book_title: Option<String>,
+    part_tilte: Option<String>,
+    part_link: Option<String>,
+}
+
+impl LinkPage {
+    fn new(
+        book_title: Option<String>,
+        part_tilte: Option<String>,
+        part_link: Option<String>,
+        book_title_code: String,
+    ) -> Self {
+        Self {
+            book_title,
+            part_tilte,
+            part_link,
+            book_title_code,
+        }
+    }
+}
+impl Display for LinkPage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.part_link.is_none() {
+            write!(
+                f,
+                "{}:::{}:::{}",
+                self.book_title_code,
+                self.book_title.as_ref().unwrap(),
+                self.part_tilte.as_ref().unwrap()
+            )
+        } else {
+            write!(
+                f,
+                "{}:::{}:::{}:::{}",
+                self.book_title_code,
+                self.book_title.as_ref().unwrap(),
+                self.part_tilte.as_ref().unwrap(),
+                self.part_link.as_ref().unwrap()
+            )
+        }
+    }
+}
+impl From<String> for LinkPage {
+    fn from(e: String) -> Self {
+        // string format : booktitle:::parttitle:::partlink
+        let s = e
+            .split(":::")
+            .collect::<Vec<_>>()
+            .iter()
+            .map(|el| el.to_string())
+            .collect::<Vec<_>>();
+        if s.len() == 3 {
+            Self {
+                book_title: s.get(1).map(|e| e.to_owned()),
+                part_tilte: s.get(2).map(|e| e.to_owned()),
+                part_link: None,
+                book_title_code: s.get(0).as_ref().unwrap().to_string(),
+            }
+        } else {
+            Self {
+                book_title: s.get(1).map(|e| e.to_owned()),
+                part_tilte: s.get(2).map(|e| e.to_owned()),
+                part_link: s.last().map(|e| e.to_owned()),
+                book_title_code: s.get(0).as_ref().unwrap().to_string(),
+            }
+        }
+    }
 }

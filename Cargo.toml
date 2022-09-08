@@ -10,8 +10,12 @@ clap ={version= "3.2.16",features = ["derive"]}
 thiserror = "1.0.30"
 async-trait = "0.1.57"
 tokio = { version = "1.20.1", features = ["full"] }
-reqwest ={version= "0.11.11",features=["rustls-tls"],default-features=false}
+# must write in this format,or it will compile crash on native android termux or corss compile
+# on ubuntu,even with built openssl provided via env vars
+reqwest ={version= "0.11.11",features=["rustls-tls","blocking"],default-features=false}
 scraper = "0.13.0"
 selectors = "0.23.0"
 json = "0.12.4"
 regex = "1.6.0"
+serde = {version="1.0.144", features = ["derive"] }
+serde_json = "1.0"

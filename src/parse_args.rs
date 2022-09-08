@@ -12,12 +12,17 @@ pub struct ArgConfig {
     /// target folder in current dir.
     #[clap(short, long, default_value("./output"))]
     pub output: PathBuf,
-    /// print out current names of all websites
+    /// write crawled book links to local file
     #[clap(short, long, action)]
-    pub websites: bool,
-    /// download all books from a root_page 
+    pub write: bool,
+    #[clap(short, long, action)]
+    pub down: bool,
+    /// crawl links from this site
     #[clap(short, long, value_parser)]
-    pub down: Option<String>,
+    pub crawl: Option<String>,
+    /// if this is present,use lit2go source,else use alternative
+    #[clap(short, long, action)]
+    pub lit2go: bool,
     // /// refreesh/update database e.g. -r C: D:
     // #[clap(
     //     short,

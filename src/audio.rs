@@ -1,7 +1,7 @@
 use crate::{
     error::Result,
     parse_args::ArgConfig,
-    site::{convert_to_site, PagePattern1, Sites},
+    site::{Lit2Go, PagePattern1},
 };
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -22,22 +22,32 @@ impl AudioBook {
     ///
     /// a macro parse site.rs to get all structs
     fn display_websites() {}
-    pub(crate) fn download(&self) -> Result<()> {
-        Ok(())
-    }
+
     /// handle arguments passed in command line
     ///
     /// e.g. show all books of a certain web site
-    pub(crate) async fn operate(&self, config: &ArgConfig) -> Result<()> {
-        if config.websites {}
-        if let Some(site) = config.down.as_ref() {
+    pub(crate) async fn operate(&self, config: ArgConfig) -> Result<()> {
+        if let Some(site) = config.crawl.as_ref() {
             // down all
             // input 5 more links
-            PagePattern1::new(
-               site.to_owned(),
-            )
-            .down()
-            .await?;
+            let link_file = config.output.join("link_file.txt");
+            let lit2go_file = config.output.join("bgs.txt");
+            let mut pg = PagePattern1::new(site.to_owned());
+            let mut lg = Lit2Go::new();
+            if config.write {
+                if config.lit2go {
+                    lg.write(&config.output).await?;
+                } else {
+                    pg.write(&link_file).await?;
+                }
+            }
+            if config.down {
+                if config.lit2go {
+                    lg.down(&config.output).await?;
+                } else {
+                    pg.down(&link_file, config.output.as_ref()).await?;
+                }
+            }
         }
         Ok(())
     }
