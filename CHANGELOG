@@ -1,0 +1,24 @@
+Q1: make progresss bar for each download,download total size is incorrect
+sometimes it will show EiB ?
+look at http field CONTENT-LENGTH,test the field with a simple request,
+
+test lit2go site whether supports that field.test shows it supports ACCEPT_RANGES
+
+try to insepect what return of the CONTENT_LENGTH looks like.
+
+use channel to notice increase of chunk, failed,it just seems being blocked.
+
+give up progresss bar for content RANGES parts.
+
+only show how many files have been downloaded in a batch task.
+
+skip download if file size in local is identical to length from response header
+
+Q2: test the behaviour of downloading.
+1. create a bin file to store code about downloading 
+2. try to download one file
+3. cmp file size with stream length from server
+
+Q3: write download audio text code.
+1. after finishing downloading audio files
+2. confine cocurrent tasks to 15.

@@ -17,6 +17,12 @@ pub struct ArgConfig {
     pub write: bool,
     #[clap(short, long, action)]
     pub down: bool,
+    /// create book folder for each book
+    #[clap(short, long, action)]
+    pub book_folders: bool,
+    /// print links of each book
+    #[clap(short, long, value_parser)]
+    pub print_links: Option<String>,
     /// crawl links from this site
     #[clap(short, long, value_parser)]
     pub crawl: Option<String>,

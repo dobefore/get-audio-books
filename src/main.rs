@@ -4,10 +4,13 @@ use error::ApplicationError;
 
 use crate::parse_args::ArgConfig;
 mod audio;
+mod download;
 mod error;
 mod fileops;
+mod lit2go;
 mod parse_args;
 mod site;
+mod utils;
 #[tokio::main]
 async fn main() -> Result<(), ApplicationError> {
     let c = ArgConfig::parse();

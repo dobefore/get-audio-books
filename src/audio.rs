@@ -1,8 +1,4 @@
-use crate::{
-    error::Result,
-    parse_args::ArgConfig,
-    site::{Lit2Go, PagePattern1},
-};
+use crate::{error::Result, lit2go::Lit2Go, parse_args::ArgConfig, site::PagePattern1};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 pub struct AudioBook {
@@ -47,6 +43,18 @@ impl AudioBook {
                 } else {
                     pg.down(&link_file, config.output.as_ref()).await?;
                 }
+            }
+            if config.book_folders {
+                // assume there is a folder ,named book, which contains a list of files whose contents are
+                // the same as those crawled from the website.
+                // SO extract book name info from these files.
+                if config.lit2go {
+                    lg.create_book_folders().await?;
+                }
+                pg.create_book_folder(&config.output).await?;
+            }
+            if let Some(para) = config.print_links {
+                pg.print_links(&para, &config.output)?;
             }
         }
         Ok(())

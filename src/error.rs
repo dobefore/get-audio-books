@@ -25,4 +25,6 @@ pub enum ApplicationError {
     Tokio(#[from] tokio::task::JoinError),
     #[error("JsonParse error {0}")]
     SerDeser(#[from] serde_json::Error),
+    #[error("Download error {0}")]
+    Download(String),
 }
