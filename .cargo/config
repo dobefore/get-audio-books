@@ -2,3 +2,9 @@
 linker = "aarch64-linux-musl-ld"
 rustflags = ["-C", "target-feature=+crt-static",
  "-C", "link-args=-static"]
+
+# Windows
+[target.x86_64-pc-windows-msvc]
+# statically link the C runtime (CRT)
+rustflags = ["-C", "target-feature=+crt-static"]
+

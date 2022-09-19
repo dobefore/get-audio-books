@@ -1,15 +1,13 @@
 use crate::{
-    download,
+    download::{self, check_request_range},
     error::{ApplicationError, Result},
-    fileops::{
-       open_as_append, open_as_append_async,
-         open_as_read, open_as_write,
-    },
-    site::{strip_invalid_str, AudioLink, Down, Utils},
-    utils::request_text,
+    fileops::{open_as_append, open_as_append_async, open_as_read, open_as_write},
+    site::{strip_invalid_str, Down, Utils},
+    utils::{length_equal, request_text, pdf_length_equal},
 };
+use clap::App;
 use futures::future::join_all;
-use indicatif:: ProgressBar;
+use indicatif::{MultiProgress, ProgressBar};
 use json;
 use regex::{internal::Input, Regex};
 use scraper::{element_ref::Select, ElementRef, Html, Selector};
@@ -17,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     cell::{Cell, RefCell, RefMut},
+    clone,
     collections::HashMap,
     fmt::Display,
     fs::{self, File},
@@ -70,6 +69,226 @@ impl Lit2GoLink {
         }
     }
 }
+impl From<&mut Lit2Go> for Lit2GoA {
+    fn from(lg: &mut Lit2Go) -> Self {
+        let mut bgas = vec![];
+        for bg in lg.bookpages.as_ref().unwrap() {
+            let mut bga = BookPageA::new(bg.book_name(), bg.book_link());
+            let mut cs = vec![];
+            for c in bg.chapters.as_ref().unwrap() {
+                if let Some(a) = c.audio.as_ref() {
+                    let mut ca = ChapterA::new(c.chapter_name(), c.capter_link());
+                    let aa = AudioLinkA::new(a.audio_link(), a.text());
+                    ca.set_audio(Some(aa));
+                    cs.push(ca);
+                }
+            }
+            bga.set_chapters(Some(cs));
+            bgas.push(bga);
+        }
+        Self {
+            root_site: lg.root_site(),
+            book_count: lg.book_count(),
+            bookpages: Some(bgas),
+        }
+    }
+}
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Lit2GoA {
+    pub(crate) root_site: Option<String>,
+    /// show how many books this website  will have
+    book_count: Option<u8>,
+    bookpages: Option<Vec<BookPageA>>,
+}
+
+impl Lit2GoA {
+    /// deserialize. file to [`Chapter`] by chapter name.
+    async fn de_chapter(chapter_path: &Path) -> Result<ChapterA> {
+        let f = open_as_read(&chapter_path)?;
+        let reader = std::io::BufReader::new(f);
+        let ch = serde_json::from_reader(reader)?;
+        Ok(ch)
+    }
+    async fn task_get_audio_len(
+        al: String,
+        at: String,
+        bn: String,
+        cn: String,
+        cl: String,
+        chaptera_dir: PathBuf,
+    ) -> Result<()> {
+        let mut au = AudioLinkA::new(Some(al), at);
+        au.update_content_length().await?;
+        let chaptera_path = chaptera_dir.join(format!(
+            "{}{}.txt",
+            strip_invalid_str(&bn),
+            strip_invalid_str(&cn)
+        ));
+        if chaptera_path.exists() {
+            return Ok(());
+        }
+        let mut c = ChapterA::new(cn, cl);
+        c.set_audio(Some(au));
+        // serialize to chaptera
+        let mut f = open_as_write(&chaptera_path)?;
+        let c_str = serde_json::to_string(&c)?;
+        f.write_all(&c_str.as_bytes())?;
+
+        Ok(())
+    }
+    async fn update_audio_length(&mut self, output: &Path) -> Result<()> {
+        // loop chapters,deserialize chaptera to struct
+        let chaptera_dir = output.join("chaptersa");
+        if !chaptera_dir.exists() {
+            tokio::fs::create_dir(&chaptera_dir).await?;
+        }
+        let mut audio = vec![];
+        let bgas = self.bookpages();
+        for bg in bgas.unwrap() {
+            for c in bg.chapters.as_ref().unwrap() {
+                // let mut aa=AudioLinkA::new(c.audio.as_ref().unwrap().audio_link(), c.audio.as_ref().unwrap().text());
+                let au = c.audio.as_ref().unwrap();
+                let ar = (
+                    bg.book_name().to_string(),
+                    c.chapter_name(),
+                    c.capter_link(),
+                    au.audio_link().as_ref().unwrap().to_string(),
+                    au.text(),
+                );
+                audio.push(ar);
+            }
+        }
+        // serilalize chaptera to file
+        let (tx, mut rx) = tokio::sync::mpsc::channel(15);
+        let limit = 15;
+        //    set chapter dir and error dir
+        let chs = group_by_range(audio, limit);
+
+        tokio::spawn(async move {
+            for i in chs {
+                if let Err(_) = tx.send(i).await {
+                    println!("receiver dropped");
+                    return;
+                }
+            }
+        });
+
+        while let Some(i) = rx.recv().await {
+            let mut hls = vec![];
+            let bar = ProgressBar::new(i.len() as u64);
+            bar.println("batch tasks run ******************");
+            for (bn, cn, cl, al, at) in i {
+                let cn = cn.clone();
+                let cl = cl.clone();
+                let al = al.clone();
+                let at = at.clone();
+                let chaptera_dir = chaptera_dir.clone();
+                let bar = bar.clone();
+                hls.push(
+        tokio::spawn(async move {
+loop {
+    tokio::select! {
+        ret=Lit2GoA::task_get_audio_len(al.clone(),at.clone(),bn.clone(),cn.clone(),cl.clone(),chaptera_dir.clone())=>{
+            if let Err(e) = ret {
+                bar.println(format!("{}", e));
+                bar.println(format!("任务 {} 失败! 3s后重试!",al));
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }else {
+            bar.println(format!("get link length {}", al));
+                bar.inc(1);
+                break;
+            }
+        }
+        _=tokio::time::sleep(Duration::from_secs(3*60))=>{
+            bar.println(format!("任务 {} 超时! 重试!",al));
+        }
+    }
+}
+        })
+       );
+            }
+            join_all(hls).await;
+        }
+        // deserialize to chaptera
+        let mut bgss = vec![];
+        for b in bgas.unwrap() {
+            let mut bg = BookPageA::new(b.book_name().to_string(), b.book_link().to_string());
+            let chs = b.chapters();
+            let mut chapters = vec![];
+            for cc in chs.unwrap() {
+                let c = ChapterA::new(cc.chapter_name(), cc.capter_link());
+                // deserialize chapter
+                let chapter_path = chaptera_dir.join(format!(
+                    "{}{}.txt",
+                    strip_invalid_str(&b.book_name()),
+                    strip_invalid_str(&c.chapter_name())
+                ));
+                let ch = match Lit2GoA::de_chapter(&chapter_path).await {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(ApplicationError::UpdateLit2go(format!(
+                            "deserialize error {}",
+                            chapter_path.display()
+                        )))
+                    }
+                };
+                chapters.push(ch);
+            }
+            bg.set_chapters(Some(chapters));
+            bgss.push(bg);
+        }
+        self.set_bookpages(Some(bgss));
+        // set chaters,bookpage
+
+        Ok(())
+    }
+
+    pub(crate) fn set_bookpages(&mut self, bookpages: Option<Vec<BookPageA>>) {
+        self.bookpages = bookpages;
+    }
+
+    pub(crate) fn bookpages(&self) -> Option<&Vec<BookPageA>> {
+        self.bookpages.as_ref()
+    }
+}
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct BookPageA {
+    book_name: String,
+    book_link: String,
+    /// show how many chapters this book will have
+    chapter_count: Option<u8>,
+    chapters: Option<Vec<ChapterA>>,
+}
+
+impl BookPageA {
+    pub(crate) fn new(book_name: String, book_link: String) -> Self {
+        Self {
+            book_name,
+            book_link,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn set_chapters(&mut self, chapters: Option<Vec<ChapterA>>) {
+        self.chapters = chapters;
+    }
+
+    pub(crate) fn book_name(&self) -> &str {
+        self.book_name.as_ref()
+    }
+
+    pub(crate) fn book_link(&self) -> &str {
+        self.book_link.as_ref()
+    }
+
+    pub(crate) fn chapter_count(&self) -> Option<u8> {
+        self.chapter_count
+    }
+
+    pub(crate) fn chapters(&self) -> Option<&Vec<ChapterA>> {
+        self.chapters.as_ref()
+    }
+}
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct Lit2Go {
     pub(crate) root_site: Option<String>,
@@ -94,6 +313,7 @@ async fn audio_op(
         strip_invalid_str(&book_name),
         strip_invalid_str(&name)
     ));
+
     if chapter_path.exists() {
         return Ok(());
     }
@@ -108,17 +328,39 @@ async fn audio_op(
     // c.update_audio(text_file_path, book_name, error_log)
     let html = request_text(&link).await?;
     let error_file = Arc::new(std::sync::Mutex::new(open_as_append(&error_file)?));
-    let mut c = Chapter::new(name, link);
+    let mut c = Chapter::new(name.clone(), link.clone());
     c.update_audio_async(&text_path, &book_name, error_file, &c.chapter_name(), html)
         .await?;
+
     let mut f = open_as_write(&chapter_path)?;
-    // let writer = std::io::BufWriter::new(f);
     let c_str = serde_json::to_string(&c)?;
     f.write_all(&c_str.as_bytes())?;
-    // serde_json::to_writer(writer, &c_str)?;
     Ok(())
 }
 impl Lit2Go {
+    fn count_total_size(output: &Path) -> Result<String> {
+        let lit2goa_file = output.join("lit2goa.txt");
+
+        let fa = open_as_read(&lit2goa_file)?;
+        let readera = std::io::BufReader::new(fa);
+        let lga: Lit2GoA = serde_json::from_reader(readera)?;
+        let bgs = lga.bookpages();
+        let mut total = 0;
+        for b in bgs.unwrap() {
+            for c in b.chapters().unwrap() {
+                if !c.audio.is_none() {
+                    let a = c.audio.as_ref().unwrap().audio_link();
+                    let audio_text = c.audio.as_ref().unwrap().text();
+                    if a.is_some() {
+                        let len = c.audio.as_ref().unwrap().audio_content_len;
+                        total += len;
+                    }
+                }
+            }
+        }
+        let gb = total / (1024 * 1024 * 1024);
+        Ok(format!("{} GiB", gb.to_string()))
+    }
     fn count_actual_books(&self) -> u8 {
         if let Some(bgs) = self.bookpages.as_ref() {
             bgs.len() as u8
@@ -204,7 +446,7 @@ impl Lit2Go {
     /// the limit task is 15.
     ///
     /// links: (audio path to be written to,audio link)
-    async fn download_audio(&self, links: Vec<(PathBuf, String)>) -> Result<()> {
+    async fn download_audio(&self, links: Vec<(PathBuf, String, u64)>) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let limit = 15;
 
@@ -237,41 +479,49 @@ impl Lit2Go {
     pub(crate) async fn down(&self, output: &Path) -> Result<()> {
         // read links from file via serde_json
         let lit2go_file = output.join("lit2go.txt");
-
-        let f = open_as_read(&lit2go_file)?;
-        let reader = std::io::BufReader::new(f);
-        let lg: Lit2Go = serde_json::from_reader(reader)?;
+        let lit2goa_file = output.join("lit2goa.txt");
+        let fa = open_as_read(&lit2goa_file)?;
+        let readera = std::io::BufReader::new(fa);
+        let lga: Lit2GoA = serde_json::from_reader(readera)?;
         let mut links = vec![];
         let mut audio_text_links = vec![];
-
-        for bg in lg.bookpages.as_ref().unwrap() {
+        let books_dir = output.join("books");
+        if !books_dir.exists() {
+            tokio::fs::create_dir_all(&books_dir).await?;
+        }
+        for bg in lga.bookpages.as_ref().unwrap() {
             let bgna = strip_invalid_str(&bg.book_name());
-            let book_dir = output.join(bgna);
-            if !book_dir.exists() {
-                tokio::fs::create_dir(&book_dir).await?;
-            }
+            // maybe not exist 
+        let book_dir = books_dir.join(bgna);
             for c in bg.chapters.as_ref().unwrap() {
                 if !c.audio.is_none() {
                     let a = c.audio.as_ref().unwrap().audio_link();
-                    let audio_text = c.audio.as_ref().unwrap().text();
+                    let audio_text_link = c.audio.as_ref().unwrap().text();
                     if a.is_some() {
                         let l = a.as_ref().unwrap();
                         let chapter_name = strip_invalid_str(&c.chapter_name());
+                        let audio_len = c.audio.as_ref().unwrap().audio_content_len;
+                        let audio_text_len = c.audio.as_ref().unwrap().audio_text_content_len;
                         links.push((
                             book_dir.clone().join(format!("{}.mp3", chapter_name)),
-                            l.to_string(),
+                            l.to_string(),audio_len
+                          
                         ));
                         audio_text_links.push((
-                            book_dir.clone().join(format!("{}.pdf", chapter_name)),
-                            audio_text,
+                         book_dir.clone().join(format!("{}.pdf", chapter_name)),
+                            audio_text_link,audio_text_len
                         ));
                     }
                 }
             }
         }
-
-        self.download_audio(links).await?;
-        self.download_audio_text(audio_text_links).await?;
+let mut mix_links=vec![];
+for l in links {
+    mix_links.push(l);
+    mix_links.push(audio_text_links.remove(0));
+}
+        self.download_audio(mix_links).await?;
+        // self.download_audio_text(audio_text_links).await?;
         Ok(())
     }
 
@@ -282,7 +532,10 @@ impl Lit2Go {
     /// # Errors
     ///
     /// This function will return an error if .
-    async fn download_audio_text(&self, audio_text_links: Vec<(PathBuf, String)>) -> Result<()> {
+    async fn download_audio_text(
+        &self,
+        audio_text_links: Vec<(PathBuf, String, u64)>,
+    ) -> Result<()> {
         // split vec to a collection of vecs that each vec consists of 15 items
         let tasks = group_by_range(audio_text_links, 15);
 
@@ -305,17 +558,24 @@ impl Lit2Go {
     /// run 15 tasks cocurrently each time.
     ///
     /// construct cocurrent environment for acutal task handler to run.
-    async fn run_download_audio_text(&self, tasks: Vec<(PathBuf, String)>) -> Result<()> {
+    async fn run_download_audio_text(&self, tasks: Vec<(PathBuf, String, u64)>) -> Result<()> {
         // add progress bar
         let bar = ProgressBar::new(tasks.len() as u64);
         bar.println("batch tasks run ******************");
         let mut handles = vec![];
-        for (pdf_path, text_link) in tasks {
+        for (pdf_path, text_link, len) in tasks {
             let bar = bar.clone();
             handles.push(tokio::spawn(async move {
                 loop {
+                    if let Ok(f) = length_equal(&pdf_path, len).await {
+                        if f {
+                            bar.inc(1);
+                            break;
+                        }
+                    }
                     if let Err(e) =
-                        Lit2Go::handle_one_audio_text((pdf_path.clone(), text_link.clone())).await
+                        Lit2Go::handle_one_audio_text((pdf_path.clone(), text_link.clone(), len))
+                            .await
                     {
                         println!("{}", e);
                     } else {
@@ -334,7 +594,7 @@ impl Lit2Go {
     }
     /// every task is expected to download one audio pdf text from the Internet or copy local plain text file to
     /// corresponding chapter folder.
-    async fn handle_one_audio_text((pdf_path, link): (PathBuf, String)) -> Result<()> {
+    async fn handle_one_audio_text((pdf_path, link, len): (PathBuf, String, u64)) -> Result<()> {
         // parse link to determine whether it is a pdf web link or local file path
         let link_path = Path::new(&link);
         if link_path
@@ -361,9 +621,16 @@ impl Lit2Go {
                 tokio::fs::copy(link_path, to).await?;
             };
         } else {
-            match download::down(4, link, pdf_path).await {
-                Some(_) => return Ok(()),
-                None => return Err(ApplicationError::Download("download pdf error".into())),
+            let mb = Arc::new(Mutex::new(MultiProgress::new()));
+            // if len of pdf file (if file exists) is ldentical to stream len ffrom remote,skip
+            match download::down(3 * 60, 4, link, pdf_path, mb).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    return Err(ApplicationError::Download(format!(
+                        "download pdf error {}",
+                        e
+                    )))
+                }
             }
         }
         Ok(())
@@ -428,8 +695,8 @@ impl Lit2Go {
     pub(crate) async fn write(&mut self, output: &Path) -> Result<()> {
         // parse book page,if bgs_file exist skip
         let lit2go_file = output.join("lit2go.txt");
+        let lit2goa_file = output.join("lit2goa.txt");
         let error_log = output.join("error_log.txt");
-        let lit2g_links = output.join("lit2g_links.txt");
         if !output.exists() {
             tokio::fs::create_dir(&output).await?;
         }
@@ -439,13 +706,13 @@ impl Lit2Go {
             let lg: Lit2Go = serde_json::from_reader(reader)?;
             self.set_book_count(lg.book_count);
             self.set_bookpages(lg.bookpages().map(|e| e.to_owned()));
-            if !self.equal_non_zero() {
-                return Err(ApplicationError::ValueNotEqual(format!(
-                    "book numbers are not equal, total{:?} actual {:?}",
-                    self.book_count,
-                    self.count_actual_books()
-                )));
-            }
+            // if !self.equal_non_zero() {
+            //     return Err(ApplicationError::ValueNotEqual(format!(
+            //         "book numbers are not equal, total{:?} actual {:?}",
+            //         self.book_count,
+            //         self.count_actual_books()
+            //     )));
+            // }
             println!("loaded bookpages from file");
         } else {
             let html = self.request_text(self.root_site.as_ref().unwrap()).await?;
@@ -464,21 +731,21 @@ impl Lit2Go {
         // parse chapter pages of each book
         // if chapter is none ,it means chapters of each have not been parsed,need parsing
         // write to lit2go
-        if !self.check_chapter_sanity_of_books() {
-            // if encountered error,skip this book and log it
-            match self.update_chapters_of_each_book(&error_log).await {
-                Ok(_) => {}
-                Err(_) => {
-                    let lg_str = serde_json::to_string(&self)?;
-                    std::fs::write(&lit2go_file, lg_str)?;
-                    return Err(ApplicationError::UpdateLit2go(
-                        "update_chapters_of_each_book".into(),
-                    ));
-                }
-            };
-            let lg_str = serde_json::to_string(&self)?;
-            std::fs::write(&lit2go_file, lg_str)?;
-        }
+        // if !self.check_chapter_sanity_of_books() {
+        //     // if encountered error,skip this book and log it
+        //     match self.update_chapters_of_each_book(&error_log).await {
+        //         Ok(_) => {}
+        //         Err(_) => {
+        //             let lg_str = serde_json::to_string(&self)?;
+        //             std::fs::write(&lit2go_file, lg_str)?;
+        //             return Err(ApplicationError::UpdateLit2go(
+        //                 "update_chapters_of_each_book".into(),
+        //             ));
+        //         }
+        //     };
+        //     let lg_str = serde_json::to_string(&self)?;
+        //     std::fs::write(&lit2go_file, lg_str)?;
+        // }
         println!("update chapters done");
 
         let text_dir = output.join("text");
@@ -486,65 +753,27 @@ impl Lit2Go {
             tokio::fs::create_dir(&text_dir).await?;
         }
         self.update_audio_of_each_chapter_async(&output).await?;
-        // if !self.check_audio_sanity_of_chapters() {
-        //     match self
-        //         .update_audio_of_each_chapter(&text_dir, &error_log)
-        //         .await
-        //     {
-        //         Ok(_) => {}
-        //         Err(_) => {
-        //             let lg_str = serde_json::to_string(&self)?;
-        //             std::fs::write(&lit2go_file, lg_str)?;
-        //             return Err(ApplicationError::UpdateLit2go(
-        //                 "update_audio_of_each_chapter".into(),
-        //             ));
-        //         }
-        //     };
-        //     let lg_str = serde_json::to_string(&self)?;
-        //     std::fs::write(&lit2go_file, lg_str)?;
-        // }
 
-        println!("set audio done");
-        let lgl = open_as_write(&lit2g_links)?;
-        let writer = std::io::BufWriter::new(lgl);
-        self.write_local(writer)?;
-        Ok(())
-    }
-    fn write_local(&self, writer: BufWriter<File>) -> Result<()> {
-        let bgs = self.bookpages.as_ref();
-        if let Some(bgs) = bgs {
-            let mut book_num = 0;
-            let mut lgl_vec = vec![];
-            for bg in bgs {
-                if let Some(chapters) = bg.chapters.as_ref() {
-                    for chapter in chapters {
-                        if chapter.audio.is_none() {
-                            continue;
-                        }
-                        let audio_link = chapter.audio.as_ref().unwrap().audio_link();
-                        let text = chapter.audio.as_ref().unwrap().text();
-                        if audio_link.is_none() {
-                            return Err(ApplicationError::ValueNotFound(
-                                "write to local error , audio link not found".into(),
-                            ));
-                        }
-                        let lgl = Lit2GoLink::new(
-                            Some(book_num.to_string()),
-                            Some(bg.book_name()),
-                            Some(chapter.chapter_name()),
-                            Some(audio_link.as_ref().unwrap().to_string()),
-                            Some(text),
-                        );
-                        lgl_vec.push(lgl);
-                    }
-                    book_num += 1;
-                }
-            }
-            let lgls = Lit2GoLinks::new(Some(lgl_vec));
-            let s = serde_json::to_string(&lgls)?;
-            serde_json::to_writer(writer, &s)?;
+        let lg_str = serde_json::to_string(&self)?;
+        std::fs::write(&lit2go_file, lg_str)?;
+        println!("update audio done");
+
+        let mut lga = if lit2goa_file.exists() {
+            let fa = open_as_read(&lit2goa_file)?;
+            let readera = std::io::BufReader::new(fa);
+            let lga: Lit2GoA = serde_json::from_reader(readera)?;
+            lga
+        } else {
+            let lga: Lit2GoA = self.into();
+            lga
+        };
+        if let Err(e) = lga.update_audio_length(output).await {
+            println!("{}", e);
+            let lga_str = serde_json::to_string(&lga)?;
+            std::fs::write(&lit2goa_file, lga_str)?;
         }
-
+        let lga_str = serde_json::to_string(&lga)?;
+        std::fs::write(&lit2goa_file, lga_str)?;
         Ok(())
     }
 
@@ -677,6 +906,7 @@ impl Lit2Go {
         let mut bgss = vec![];
         for b in bgs.unwrap() {
             let mut bg = BookPage::new(b.book_name(), b.book_link());
+            bg.set_chapter_count(b.chapter_count());
             let chs = b.chapters();
             let mut chapters = vec![];
 
@@ -748,34 +978,81 @@ impl Lit2Go {
     pub(crate) fn bookpages(&self) -> Option<&Vec<BookPage>> {
         self.bookpages.as_ref()
     }
-    pub(crate) fn last_bookpage(&self) -> &BookPage {
-        self.bookpages.as_ref().unwrap().last().as_ref().unwrap()
-    }
 
     pub(crate) fn set_book_count(&mut self, book_count: Option<u8>) {
         self.book_count = book_count;
     }
+
+    pub(crate) fn root_site(&self) -> Option<String> {
+        self.root_site.as_ref().map(|e| e.to_string())
+    }
+
+    pub(crate) fn book_count(&self) -> Option<u8> {
+        self.book_count
+    }
 }
-async fn download_local(v: Vec<(PathBuf, String)>) -> Result<()> {
+async fn download_local(v: Vec<(PathBuf, String, u64)>) -> Result<()> {
     let bar = ProgressBar::new(v.len() as u64);
-    bar.println("batch tasks run ******************");
+     bar.println("batch tasks run ******************");
     let mut handles = vec![];
-    for (p, l) in v {
+    let mbo = Arc::new(Mutex::new(MultiProgress::new()));
+    for (path,link,len) in v {
         let bar = bar.clone();
+        let mbo = mbo.clone();
+        let link=link.clone();
+        let path=path.clone();
+        // get its directory and create it if not exist
+        let mut par=path.ancestors();
+        par.next();
+      let parent=  par.next();
+if let Some(pt) =parent  {
+    if !pt.exists() {
+        tokio::fs::create_dir_all(pt).await?;
+    }
+}
+        let p= Path::new(&link).to_path_buf();
         handles.push(tokio::spawn(async move {
             loop {
-                bar.println(format!("downloading {}", p.clone().display()));
-                if let Some(()) = download::down(10, l.clone(), p.clone()).await {
-                    bar.inc(1);
+                if p.extension().unwrap()=="pdf" || p.extension().unwrap()=="mp3" {
+                    if let Ok(f) = length_equal(&path, len).await  {
+                        if f {
+                             bar.inc(1);
+                             break;
+                        }else {
+                        bar.println(format!("download link {} to file {}", link,path.display()));
+                        }
+                        
+                    }else {
+                        bar.println(format!("download link {} to file {}", link,path.display()));
+                        }
+                    if let Err(e) = download::down(5 * 60, 2, link.clone(), path.clone(), mbo.clone()).await {
+                        bar.println(format!("{}", e));
+                        bar.println(format!("任务 {} 失败! 3s后重试!", link));
+                       tokio::time::sleep(Duration::from_secs(3)).await;
+                   } else {
+                        bar.inc(1);
+                        break;
+                   }
+
+                }else {
+                    // txt
+                    if path.exists() {
+                        bar.inc(1);
+                        break;
+                    }
+                    match tokio::fs::copy(link.clone(), path.clone()).await {
+                        Ok(_)=> bar.inc(1),
+                        Err(e)=> bar.println(format!("{}",e))
+                    }
                     break;
                 }
-                bar.println(format!("任务 {} 失败! 3s后重试!", p.display()));
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                          
+             
             }
         }));
     }
     join_all(handles).await;
-    bar.finish();
+     bar.finish();
 
     Ok(())
 }
@@ -981,13 +1258,8 @@ fn parse_pdf_or_text(
                     .as_ref()
                     .unwrap()
                     .to_string();
-                // println!("using pdf link for audio text");
-                // println!("get pdf link : {}", &pdf);
+
                 pdf
-                // // return error
-                // return Err(ApplicationError::ParseHtmlSelector(
-                //    format!( "pdf ele len two large: {},{}",book_name,chapter_name)
-                // ));
             };
 
             pdf
@@ -1147,6 +1419,10 @@ impl BookPage {
     pub(crate) fn book_link(&self) -> String {
         self.book_link.to_string()
     }
+
+    pub(crate) fn chapter_count(&self) -> Option<u8> {
+        self.chapter_count
+    }
 }
 unsafe impl Sync for Chapter {}
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -1155,6 +1431,35 @@ pub(crate) struct Chapter {
     capter_link: String,
     /// one chapter has one audio
     pub(crate) audio: Option<AudioLink>,
+}
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct ChapterA {
+    chapter_name: String,
+    capter_link: String,
+    /// one chapter has one audio
+    pub(crate) audio: Option<AudioLinkA>,
+}
+
+impl ChapterA {
+    pub(crate) fn new(chapter_name: String, capter_link: String) -> Self {
+        Self {
+            chapter_name,
+            capter_link,
+            audio: None,
+        }
+    }
+
+    pub(crate) fn set_audio(&mut self, audio: Option<AudioLinkA>) {
+        self.audio = audio;
+    }
+
+    pub(crate) fn chapter_name(&self) -> String {
+        self.chapter_name.to_string()
+    }
+
+    pub(crate) fn capter_link(&self) -> String {
+        self.capter_link.to_string()
+    }
 }
 impl Down for Chapter {}
 impl Chapter {
@@ -1431,6 +1736,91 @@ impl Chapter {
         self.capter_link.to_string()
     }
 }
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct AudioLinkA {
+    audio_link: Option<String>,
+    /// contain mulit-line plain text string
+    text: String,
+    // /// content length of audio stream
+    audio_content_len: u64,
+    audio_text_content_len: u64,
+}
+
+impl AudioLinkA {
+    pub(crate) fn new(audio_link: Option<String>, text: String) -> Self {
+        Self {
+            audio_link,
+            text,
+            ..Default::default()
+        }
+    }
+
+    /// update audio_content_len and audio_text_content_len
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if .
+    pub(crate) async fn update_content_length(&mut self) -> Result<()> {
+        // audio_content_len
+        if let Some(al) = self.audio_link.as_ref() {
+            let (_, audio_len) = check_request_range(al).await?;
+            self.set_audio_content_len(audio_len);
+        }
+        // audio_text_content_len,need to determine whether audio text is a pdf link or local file path
+        let link_path = Path::new(&self.text);
+        if link_path
+            .extension()
+            .as_ref()
+            .unwrap()
+            .to_str()
+            .as_ref()
+            .unwrap()
+            .to_owned()
+            == "pdf"
+        {
+            let (_, audio_text_len) = check_request_range(&self.text).await?;
+            self.set_audio_text_content_len(audio_text_len);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_audio_content_len(&mut self, audio_content_len: u64) {
+        self.audio_content_len = audio_content_len;
+    }
+
+    pub(crate) fn set_audio_text_content_len(&mut self, audio_text_content_len: u64) {
+        self.audio_text_content_len = audio_text_content_len;
+    }
+
+    pub(crate) fn audio_link(&self) -> Option<String> {
+        self.audio_link.as_ref().map(|e| e.to_string())
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.text.to_string()
+    }
+}
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub(crate) struct AudioLink {
+    audio_link: Option<String>,
+    /// contain mulit-line plain text string
+    text: String,
+    // /// content length of audio stream
+    // content_len:u64
+}
+impl AudioLink {
+    pub(crate) fn new(audio_link: Option<String>, text: String) -> Self {
+        Self { audio_link, text }
+    }
+
+    pub(crate) fn audio_link(&self) -> Option<String> {
+        self.audio_link.as_ref().map(|e| e.to_string())
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.text.to_string()
+    }
+}
 fn group_by_range<T>(mut v: Vec<T>, range: u8) -> Vec<Vec<T>> {
     let mut g = vec![];
     loop {
@@ -1460,4 +1850,10 @@ fn test_group_by_range() {
 
     assert_eq!(r, r1);
     assert_eq!(expect.len(), group_by_range(r2, 15).len());
+}
+#[test]
+fn test_count_file_size() {
+    // 66 Gb
+    let output: PathBuf = ".".into();
+    println!("{}", Lit2Go::count_total_size(&output).unwrap());
 }

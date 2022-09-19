@@ -11,6 +11,7 @@ mod lit2go;
 mod parse_args;
 mod site;
 mod utils;
+mod config;
 #[tokio::main]
 async fn main() -> Result<(), ApplicationError> {
     let c = ArgConfig::parse();
